@@ -12,5 +12,6 @@ public:
 	//If read_bound_import_raw_data, raw bound import data will be read (used to get bound import info)
 	//If read_debug_raw_data, raw debug data will be read (used to get image debug info)
 	static pe_base create_pe(std::istream& file, bool read_debug_raw_data = true);
+	static pe_base create_pe (Nirvana::AccessBuf::_ptr_type file, bool read_debug_raw_data = true);
 };
 }

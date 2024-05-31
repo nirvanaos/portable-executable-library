@@ -45,6 +45,21 @@ pe_base::pe_base(std::istream& file, const pe_properties& props, bool read_debug
 	file.clear();
 }
 
+pe_base::pe_base (Nirvana::AccessBuf::_ptr_type file, const pe_properties& props, bool read_debug_raw_data)
+{
+	props_ = props.duplicate ().release ();
+
+	auto old_offset = file->position ();
+	file->position (0);
+
+	//Read DOS header, PE headers and section data
+	read_dos_header (file);
+	read_pe (file, read_debug_raw_data);
+
+	//Restore istream state
+	file->position (old_offset);
+}
+
 pe_base::pe_base(const pe_properties& props, uint32_t section_alignment, bool dll, uint16_t subsystem)
 {
 	props_ = props.duplicate().release();
@@ -766,14 +781,33 @@ void pe_base::read_dos_header(std::istream& file, image_dos_header& header)
 		throw pe_exception("Unable to read IMAGE_DOS_HEADER", pe_exception::bad_dos_header);
 
 	//Check DOS header magic
-	if(header.e_magic != 0x5a4d) //"MZ"
+	static const char DOS_magic [] = { 'M', 'Z' };
+	if (header.e_magic != *(const uint16_t*)DOS_magic)
 		throw pe_exception("IMAGE_DOS_HEADER signature is incorrect", pe_exception::bad_dos_header);
+}
+
+//Reads DOS headers from istream
+void pe_base::read_dos_header (Nirvana::AccessBuf::_ptr_type file, image_dos_header& header)
+{
+	//Read DOS header and check istream
+	file->read (&header, sizeof (image_dos_header));
+
+	//Check DOS header magic
+	static const char DOS_magic [] = { 'M', 'Z' };
+	if (header.e_magic != *(const uint16_t*)DOS_magic)
+		throw pe_exception ("IMAGE_DOS_HEADER signature is incorrect", pe_exception::bad_dos_header);
 }
 
 //Reads DOS headers from istream
 void pe_base::read_dos_header(std::istream& file)
 {
 	read_dos_header(file, dos_header_);
+}
+
+//Reads DOS headers from istream
+void pe_base::read_dos_header (Nirvana::AccessBuf::_ptr_type file)
+{
+	read_dos_header (file, dos_header_);
 }
 
 //Reads PE image from istream
@@ -797,7 +831,8 @@ void pe_base::read_pe(std::istream& file, bool read_debug_raw_data)
 		throw pe_exception("Error reading IMAGE_NT_HEADERS", pe_exception::error_reading_image_nt_headers);
 
 	//Check PE signature
-	if(get_pe_signature() != 0x4550) //"PE"
+	static const char PE_magic [] = { 'P', 'E', '\0', '\0' };
+	if (get_pe_signature () != *(const uint32_t*)PE_magic) //"PE"
 		throw pe_exception("Incorrect PE signature", pe_exception::pe_signature_incorrect);
 
 	//Check number of directories
@@ -1014,6 +1049,207 @@ void pe_base::read_pe(std::istream& file, bool read_debug_raw_data)
 	}
 }
 
+//Reads PE image from AccessBuf
+void pe_base::read_pe (Nirvana::AccessBuf::_ptr_type file, bool read_debug_raw_data)
+{
+	//Get istream size
+	auto filesize = file->direct ()->size ();
+
+	//Check if PE header is DWORD-aligned
+	if ((dos_header_.e_lfanew % sizeof (uint32_t)) != 0)
+		throw pe_exception ("PE header is not DWORD-aligned", pe_exception::bad_dos_header);
+
+	//Seek to NT headers
+	file->position (dos_header_.e_lfanew);
+
+	//Read NT headers
+	file->read (get_nt_headers_ptr (), get_sizeof_nt_header () - sizeof (image_data_directory) * image_numberof_directory_entries);
+
+	//Check PE signature
+	static const char PE_magic [] = { 'P', 'E', '\0', '\0' };
+	if (get_pe_signature () != *(const uint32_t*)PE_magic) //"PE"
+		throw pe_exception ("Incorrect PE signature", pe_exception::pe_signature_incorrect);
+
+	//Check number of directories
+	if (get_number_of_rvas_and_sizes () > image_numberof_directory_entries)
+		set_number_of_rvas_and_sizes (image_numberof_directory_entries);
+
+	if (get_number_of_rvas_and_sizes () > 0) {
+		//Read data directory headers, if any
+		file->read (get_nt_headers_ptr () + (get_sizeof_nt_header () - sizeof (image_data_directory) * image_numberof_directory_entries), sizeof (image_data_directory) * get_number_of_rvas_and_sizes ());
+	}
+
+	//Check section number
+	//Images with zero section number accepted
+	if (get_number_of_sections () > maximum_number_of_sections)
+		throw pe_exception ("Incorrect number of sections", pe_exception::section_number_incorrect);
+
+	//Check PE magic
+	if (get_magic () != get_needed_magic ())
+		throw pe_exception ("Incorrect PE signature", pe_exception::pe_signature_incorrect);
+
+	//Check section alignment
+	if (!pe_utils::is_power_of_2 (get_section_alignment ()))
+		throw pe_exception ("Incorrect section alignment", pe_exception::incorrect_section_alignment);
+
+	//Check file alignment
+	if (!pe_utils::is_power_of_2 (get_file_alignment ()))
+		throw pe_exception ("Incorrect file alignment", pe_exception::incorrect_file_alignment);
+
+	if (get_file_alignment () != get_section_alignment () && (get_file_alignment () < minimum_file_alignment || get_file_alignment () > get_section_alignment ()))
+		throw pe_exception ("Incorrect file alignment", pe_exception::incorrect_file_alignment);
+
+	//Check size of image
+	if (pe_utils::align_up (get_size_of_image (), get_section_alignment ()) == 0)
+		throw pe_exception ("Incorrect size of image", pe_exception::incorrect_size_of_image);
+
+	//Read rich data overlay / DOS stub (if any)
+	if (static_cast<uint32_t>(dos_header_.e_lfanew) > sizeof (image_dos_header)) {
+		rich_overlay_.resize (dos_header_.e_lfanew - sizeof (image_dos_header));
+		file->position (sizeof (image_dos_header));
+		file->read (&rich_overlay_ [0], dos_header_.e_lfanew - sizeof (image_dos_header));
+	}
+
+	//Calculate first section raw position
+	//Sum is safe here
+	uint32_t first_section = dos_header_.e_lfanew + get_size_of_optional_header () + sizeof (image_file_header) + sizeof (uint32_t) /* Signature */;
+
+	if (get_number_of_sections () > 0) {
+		//Go to first section
+		file->position (first_section);
+	}
+
+	uint32_t last_raw_size = 0;
+
+	//Read all sections
+	for (int i = 0; i < get_number_of_sections (); i++) {
+		section s;
+		//Read section header
+		file->read (reinterpret_cast<char*>(&s.get_raw_header ()), sizeof (image_section_header));
+
+		//Save next section header position
+		std::streamoff next_sect = file->position ();
+
+		//Check section virtual and raw sizes
+		if (!s.get_size_of_raw_data () && !s.get_virtual_size ())
+			throw pe_exception ("Virtual and Physical sizes of section can't be 0 at the same time", pe_exception::zero_section_sizes);
+
+		//Check for adequate values of section fields
+		if (!pe_utils::is_sum_safe (s.get_virtual_address (), s.get_virtual_size ()) || s.get_virtual_size () > pe_utils::two_gb
+			|| !pe_utils::is_sum_safe (s.get_pointer_to_raw_data (), s.get_size_of_raw_data ()) || s.get_size_of_raw_data () > pe_utils::two_gb)
+			throw pe_exception ("Incorrect section address or size", pe_exception::section_incorrect_addr_or_size);
+
+		if (s.get_size_of_raw_data () != 0) {
+			//If section has raw data
+
+			//If section raw data size is greater than virtual, fix it
+			last_raw_size = s.get_size_of_raw_data ();
+			if (pe_utils::align_up (s.get_size_of_raw_data (), get_file_alignment ()) > pe_utils::align_up (s.get_virtual_size (), get_section_alignment ()))
+				s.set_size_of_raw_data (s.get_virtual_size ());
+
+			//Check virtual and raw section sizes and addresses
+			if (s.get_virtual_address () + pe_utils::align_up (s.get_virtual_size (), get_section_alignment ()) > pe_utils::align_up (get_size_of_image (), get_section_alignment ())
+				||
+				pe_utils::align_down (s.get_pointer_to_raw_data (), get_file_alignment ()) + s.get_size_of_raw_data () > static_cast<uint32_t>(filesize))
+				throw pe_exception ("Incorrect section address or size", pe_exception::section_incorrect_addr_or_size);
+
+			//Seek to section raw data
+			file->position (pe_utils::align_down (s.get_pointer_to_raw_data (), get_file_alignment ()));
+
+			//Read section raw data
+			s.get_raw_data ().resize (s.get_size_of_raw_data ());
+			file->read (&s.get_raw_data () [0], s.get_size_of_raw_data ());
+		}
+
+		//Check virtual address and size of section
+		if (s.get_virtual_address () + s.get_aligned_virtual_size (get_section_alignment ()) > pe_utils::align_up (get_size_of_image (), get_section_alignment ()))
+			throw pe_exception ("Incorrect section address or size", pe_exception::section_incorrect_addr_or_size);
+
+		//Save section
+		sections_.push_back (s);
+
+		//Seek to the next section header
+		file->position (next_sect);
+	}
+
+	//Check size of headers: SizeOfHeaders can't be larger than first section VA
+	if (!sections_.empty () && get_size_of_headers () > sections_.front ().get_virtual_address ())
+		throw pe_exception ("Incorrect size of headers", pe_exception::incorrect_size_of_headers);
+
+	//If image has more than two sections
+	if (sections_.size () >= 2) {
+		//Check sections virtual sizes
+		for (section_list::const_iterator i = sections_.begin () + 1; i != sections_.end (); ++i) {
+			if ((*i).get_virtual_address () != (*(i - 1)).get_virtual_address () + (*(i - 1)).get_aligned_virtual_size (get_section_alignment ()))
+				throw pe_exception ("Section table is incorrect", pe_exception::image_section_table_incorrect);
+		}
+	}
+
+	//Check if image has overlay in the end of file
+	has_overlay_ = !sections_.empty () && filesize > (sections_.back ().get_pointer_to_raw_data () + last_raw_size);
+
+	{
+		//Additionally, read data from the beginning of istream to size of headers
+		file->position (0);
+		uint32_t size_of_headers = std::min<uint32_t> (get_size_of_headers (), static_cast<uint32_t>(filesize));
+
+		if (!sections_.empty ()) {
+			for (section_list::const_iterator i = sections_.begin (); i != sections_.end (); ++i) {
+				if (!(*i).empty ()) {
+					size_of_headers = std::min<uint32_t> (get_size_of_headers (), (*i).get_pointer_to_raw_data ());
+					break;
+				}
+			}
+		}
+
+		full_headers_data_.resize (size_of_headers);
+		file->read (&full_headers_data_ [0], size_of_headers);
+	}
+
+	//Moreover, if there's debug directory, read its raw data for some debug info types
+	while (read_debug_raw_data && has_debug ()) {
+		try {
+			//Check the length in bytes of the section containing debug directory
+			if (section_data_length_from_rva (get_directory_rva (image_directory_entry_debug), get_directory_rva (image_directory_entry_debug), section_data_virtual, true) < sizeof (image_debug_directory))
+				break;
+
+			unsigned long current_pos = get_directory_rva (image_directory_entry_debug);
+
+			//First IMAGE_DEBUG_DIRECTORY table
+			image_debug_directory directory = section_data_from_rva<image_debug_directory> (current_pos, section_data_virtual, true);
+
+			//Iterate over all IMAGE_DEBUG_DIRECTORY directories
+			while (directory.PointerToRawData
+				&& current_pos < get_directory_rva (image_directory_entry_debug) + get_directory_size (image_directory_entry_debug)) {
+				//If we have something to read
+				if ((directory.Type == image_debug_type_codeview
+					|| directory.Type == image_debug_type_misc
+					|| directory.Type == image_debug_type_coff)
+					&& directory.SizeOfData) {
+					std::string data;
+					data.resize (directory.SizeOfData);
+					file->position (directory.PointerToRawData);
+					file->read (&data [0], directory.SizeOfData);
+
+					debug_data_.insert (std::make_pair (directory.PointerToRawData, data));
+				}
+
+				//Go to next debug entry
+				current_pos += sizeof (image_debug_directory);
+				directory = section_data_from_rva<image_debug_directory> (current_pos, section_data_virtual, true);
+			}
+
+			break;
+		} catch (const pe_exception&) {
+			//Don't throw any exception here, if debug info is corrupted or incorrect
+			break;
+		} catch (const std::bad_alloc&) {
+			//Don't throw any exception here, if debug info is corrupted or incorrect
+			break;
+		}
+	}
+}
+
 //Returns PE type of this image
 pe_type pe_base::get_pe_type() const
 {
@@ -1046,7 +1282,8 @@ pe_type pe_base::get_pe_type(std::istream& file)
 			throw pe_exception("Error reading IMAGE_NT_HEADERS", pe_exception::error_reading_image_nt_headers);
 
 		//Check NT headers signature
-		if(nt_headers.Signature != 0x4550) //"PE"
+		static const char PE_magic [] = { 'P', 'E', '\0', '\0' };
+		if(nt_headers.Signature != *(const uint32_t*)PE_magic) //"PE"
 			throw pe_exception("Incorrect PE signature", pe_exception::pe_signature_incorrect);
 
 		//Check NT headers magic
@@ -1067,6 +1304,39 @@ pe_type pe_base::get_pe_type(std::istream& file)
 	file.exceptions(state);
 	file.seekg(old_offset);
 	file.clear();
+
+	//Determine PE type and return it
+	return nt_headers.OptionalHeader.Magic == image_nt_optional_hdr64_magic ? pe_type_64 : pe_type_32;
+}
+
+//Returns PE type (PE or PE+) from pe_type enumeration (minimal correctness checks)
+pe_type pe_base::get_pe_type (Nirvana::AccessBuf::_ptr_type file)
+{
+	//Save state of the istream
+	auto old_offset = file->position ();
+	image_nt_headers32 nt_headers;
+	image_dos_header header;
+
+	//Read dos header
+	read_dos_header (file, header);
+
+	//Seek to the NT headers start
+	file->position (header.e_lfanew);
+
+	//Read NT headers (we're using 32-bit version, because there's no significant differencies between 32 and 64 bit version structures)
+	file->read (reinterpret_cast<char*>(&nt_headers), sizeof (image_nt_headers32) - sizeof (image_data_directory) * image_numberof_directory_entries);
+
+	//Check NT headers signature
+	static const char PE_magic [] = { 'P', 'E', '\0', '\0' };
+	if (nt_headers.Signature != *(const uint32_t*)PE_magic) //"PE"
+		throw pe_exception ("Incorrect PE signature", pe_exception::pe_signature_incorrect);
+
+	//Check NT headers magic
+	if (nt_headers.OptionalHeader.Magic != image_nt_optional_hdr32_magic && nt_headers.OptionalHeader.Magic != image_nt_optional_hdr64_magic)
+		throw pe_exception ("Incorrect PE signature", pe_exception::pe_signature_incorrect);
+
+	//Restore stream state
+	file->position (old_offset);
 
 	//Determine PE type and return it
 	return nt_headers.OptionalHeader.Magic == image_nt_optional_hdr64_magic ? pe_type_64 : pe_type_32;

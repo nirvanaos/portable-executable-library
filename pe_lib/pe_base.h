@@ -9,6 +9,7 @@
 #include "utils.h"
 #include "pe_section.h"
 #include "pe_properties.h"
+#include <Nirvana/File.h>
 
 //Please don't remove this information from header
 //PEBliss 1.0.0
@@ -34,6 +35,9 @@ class pe_base
 public: //CONSTRUCTORS
 	//Constructor from stream
 	pe_base(std::istream& file, const pe_properties& props, bool read_debug_raw_data = true);
+
+	// Constructor from AccessBuf
+	pe_base (Nirvana::AccessBuf::_ptr_type file, const pe_properties& props, bool read_debug_raw_data = true);
 
 	//Constructor of empty PE-file
 	explicit pe_base(const pe_properties& props, uint32_t section_alignment = 0x1000, bool dll = false, uint16_t subsystem = pe_win::image_subsystem_windows_gui);
@@ -250,7 +254,8 @@ public: //PE HEADER
 	
 	//Reads and checks DOS header
 	static void read_dos_header(std::istream& file, pe_win::image_dos_header& header);
-	
+	static void read_dos_header(Nirvana::AccessBuf::_ptr_type file, pe_win::image_dos_header& header);
+
 	//Returns sizeof() nt headers
 	uint32_t get_sizeof_nt_header() const;
 	//Returns sizeof() optional headers
@@ -463,6 +468,8 @@ public: //IMAGE SECTIONS
 public: //IMAGE
 	//Returns PE type (PE or PE+) from pe_type enumeration (minimal correctness checks)
 	static pe_type get_pe_type(std::istream& file);
+	//Returns PE type (PE or PE+) from pe_type enumeration (minimal correctness checks)
+	static pe_type get_pe_type (Nirvana::AccessBuf::_ptr_type file);
 	//Returns PE type of this image
 	pe_type get_pe_type() const;
 
@@ -496,9 +503,11 @@ private:
 
 	//Reads and checks DOS header
 	void read_dos_header(std::istream& file);
+	void read_dos_header (Nirvana::AccessBuf::_ptr_type file);
 
 	//Reads and checks PE headers and section headers, data
 	void read_pe(std::istream& file, bool read_debug_raw_data);
+	void read_pe (Nirvana::AccessBuf::_ptr_type file, bool read_debug_raw_data);
 
 	//Sets number of sections
 	void set_number_of_sections(uint16_t number);
