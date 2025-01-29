@@ -1053,7 +1053,7 @@ void pe_base::read_pe(std::istream& file, bool read_debug_raw_data)
 void pe_base::read_pe (Nirvana::AccessBuf::_ptr_type file, bool read_debug_raw_data)
 {
 	//Get istream size
-	auto filesize = file->direct ()->size ();
+	auto filesize = file->size ();
 
 	//Check if PE header is DWORD-aligned
 	if ((dos_header_.e_lfanew % sizeof (uint32_t)) != 0)
