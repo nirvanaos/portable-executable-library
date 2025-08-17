@@ -9,6 +9,7 @@
 #include "utils.h"
 #include "pe_section.h"
 #include "pe_properties.h"
+#include <CORBA/CORBA.h>
 #include <Nirvana/File.h>
 
 //Please don't remove this information from header
